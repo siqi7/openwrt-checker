@@ -1,0 +1,32 @@
+# OpenWrt / LuCI 批量登录检测 —— systemd 服务模板
+#
+# 这是参考示例，路径按 /opt/openwrt-checker 写死。
+# 如果你的安装目录不是这个，请直接跑 ./install.sh，它会自动生成正确路径的
+# /etc/systemd/system/openwrt-checker.service。
+#
+# 手动安装：
+#   sudo cp openwrt-checker.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now openwrt-checker
+#   journalctl -u openwrt-checker -f
+
+[Unit]
+Description=OpenWrt / LuCI batch login checker (port 5678)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/openwrt-checker
+ExecStart=/usr/bin/python3 /opt/openwrt-checker/check.py --host 0.0.0.0 --port 5678
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+KillSignal=SIGINT
+TimeoutStopSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
