@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-OpenWrt / LuCI 批量登录检测工具 —— Linux 零依赖单文件版 (v5)
+OpenWrt / LuCI 批量弱口令审计工具 —— Linux 零依赖单文件版 (v5)
+两阶段流水线：阶段A 并发探活（筛掉死机与非 LuCI）→ 阶段B 仅对存活目标跑弱口令字典；
+必须拿到 sysauth* 会话并回访受保护页确认，才算登录成功。
 
 · 只用 Python 标准库：不需要 pip、不需要联网、不需要虚拟环境
 · 默认监听 0.0.0.0:5678
@@ -51,7 +53,7 @@ from urllib.parse import urlparse, urljoin, parse_qs
 
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 5678
-VERSION = "5.0-linux"
+VERSION = "5.2-linux"
 
 USER_AGENT = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
@@ -92,12 +94,41 @@ CHALLENGE_PATTERNS = [
     r"checking your browser",
     r"enable javascript and cookies to continue",
     r"attention required",
-    r"cf-error-details",
     r'class="no-js ie6 oldie"',
 ]
 
+# 只有这几种状态码才把「正文命中特征」当作人机验证。
+# 反面教材：cf-error-details 是 Cloudflare 的**错误页**（521/522/525 等源站不可达），
+# 出现在 5xx 上。早先它被算作挑战特征，导致 CF 后面的坏源站被当成挑战页狂重试 12 秒。
+CHALLENGE_STATUSES = (403, 429, 503)
+
 CHALLENGE_RETRIES = 4          # 被挑战时重试次数
 CHALLENGE_DELAY = 2.0          # 首次重试等待秒数，逐次递增（2s / 4s / 6s）
+
+# ---------------------------------------------------------------------------
+# 弱口令字典
+# ---------------------------------------------------------------------------
+# 顺序 = 尝试顺序。前几组按真实世界的命中率排，命中即停，所以绝大多数设备
+# 在第 1~3 次就能出结果，不会把 8 组全跑完。
+#
+# 授权提示：仅对你拥有或已获得书面授权的设备使用。这不是「破解」工具，
+# 它只有一个固定的默认口令表，用途是找出还在用出厂/默认口令的设备。
+WEAK_CREDS = [
+    ("root",  ""),            # OpenWrt 原生默认：root 且无密码
+    ("root",  "password"),    # 网上教程里最常见的一档
+    ("admin", "admin"),       # 路由器通用出厂默认
+    ("root",  "root"),
+    ("root",  "admin"),
+    ("admin", "password"),
+    ("admin", ""),
+    ("admin", "root"),
+]
+
+# 两阶段超时：探活用短超时快速筛掉死主机，凭据审计才给足时间
+DEFAULT_PROBE_TIMEOUT = 3
+DEFAULT_AUDIT_TIMEOUT = 8
+
+NO_CRED_LABEL = "无需密码（直接进入后台）"
 
 RE_INPUT_TAG = re.compile(r"<input\b[^>]*>", re.I | re.S)
 RE_ATTR = re.compile(r"""([\w:.-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>=`]+))""")
@@ -177,12 +208,22 @@ def has_fail_signal(html):
     return False
 
 
-def is_challenge_page(html, headers=None):
-    """判断响应是不是 CDN / 人机验证 拦截页（而不是目标本身的页面）。"""
+def is_challenge_page(html, headers=None, status=None):
+    """
+    判断响应是不是 CDN / 人机验证 拦截页（而不是目标本身的页面）。
+
+    双保险：
+      - 响应头出现 Cf-Mitigated / X-Sucuri-Block -> 一定是拦截，与状态码无关
+      - 正文命中特征时，还要求状态码属于 CHALLENGE_STATUSES；
+        否则源站错误页、正常页面里恰好出现「just a moment」这类字样时会被误判，
+        白白退避重试十几秒。
+    """
     if headers:
         for k in ("Cf-Mitigated", "X-Sucuri-Block"):
             if headers.get(k):
                 return True
+    if status is not None and status not in CHALLENGE_STATUSES:
+        return False
     h = html.lower()
     for p in CHALLENGE_PATTERNS:
         if re.search(p, h):
@@ -193,6 +234,11 @@ def is_challenge_page(html, headers=None):
 def page_title(html):
     m = RE_TITLE.search(html)
     return re.sub(r"\s+", " ", m.group(1)).strip()[:80] if m else ""
+
+
+def _yn(v):
+    """把布尔指纹渲染成中文，诊断轨迹里比 True/False 好读。"""
+    return "是" if v else "否"
 
 
 def fingerprint(html, final_url, html_l=None):
@@ -301,29 +347,37 @@ class Session:
     并且所有请求头都在请求上显式给出，不依赖 opener.addheaders。
     """
 
-    def __init__(self, timeout=8, basic_auth=None):
+    def __init__(self, timeout=8, basic_auth=None, trace=None):
         self.timeout = timeout
         self._basic_auth = basic_auth
+        self.trace = trace
+        self._trace_on = trace is not None      # 只有开诊断才记录，平时零开销
         self.jar = http.cookiejar.CookieJar()
 
         self._ctx = ssl.create_default_context()
         self._ctx.check_hostname = False
         self._ctx.verify_mode = ssl.CERT_NONE
 
+        # Basic 认证凭据预先算好，请求时直接带上（见 _raw 的说明）
+        self._basic_header = None
+        if basic_auth:
+            _uri, _user, _pwd = basic_auth
+            token = base64.b64encode(("%s:%s" % (_user, _pwd)).encode("utf-8")).decode()
+            self._basic_header = "Basic " + token
+
         self._follow = self._make_opener(no_redirect=False)
         self._nore = self._make_opener(no_redirect=True)
 
     def _make_opener(self, no_redirect):
+        # 刻意**不装 HTTPBasicAuthHandler**：它的工作方式是先发一次请求拿 401、
+        # 再带上 Authorization 重发一次，等于每个请求都打两遍。Basic 认证的设备
+        # 又要探测又要验证，请求数直接翻倍。改成在 _raw 里预先带上头，
+        # 凭据错了就老老实实收 401 —— 这本来也是我们想看到的失败信号。
         handlers = [
             urllib.request.ProxyHandler({}),   # 关键：内网地址不能走系统代理
             urllib.request.HTTPCookieProcessor(self.jar),
             urllib.request.HTTPSHandler(context=self._ctx),
         ]
-        if self._basic_auth:
-            uri, user, pwd = self._basic_auth
-            mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
-            mgr.add_password(None, uri, user, pwd)
-            handlers.append(urllib.request.HTTPBasicAuthHandler(mgr))
         if no_redirect:
             handlers.insert(0, _NoRedirect())
         return urllib.request.build_opener(*handlers)
@@ -338,6 +392,8 @@ class Session:
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
             "Accept-Encoding": "gzip",
         }
+        if self._basic_header:
+            headers["Authorization"] = self._basic_header
         body = None
         if data is not None:
             body = urllib.parse.urlencode(data).encode("utf-8")
@@ -371,13 +427,24 @@ class Session:
         """
         attempts = CHALLENGE_RETRIES if retry_challenge else 1
         result = None
+        method = "POST" if data is not None else "GET"
         for attempt in range(attempts):
-            result = self._raw(url, data, allow_redirects)
-            if not is_challenge_page(result["text"], result["headers"]):
+            try:
+                result = self._raw(url, data, allow_redirects)
+            except ConnectFailed as e:
+                self.note("  %-4s %s -> 连接失败：%s" % (method, url, str(e)[:60]))
+                raise
+            if not is_challenge_page(result["text"], result["headers"], result["status"]):
+                self.note(self.describe(url, data, result))
                 return result
             if attempt < attempts - 1:
+                self.note("  %-4s %s -> HTTP %s 拿到人机验证页，%gs 后重试（%d/%d）"
+                          % (method, url, result["status"],
+                             CHALLENGE_DELAY * (attempt + 1), attempt + 1, attempts - 1))
                 time.sleep(CHALLENGE_DELAY * (attempt + 1))
         result["challenged"] = True
+        self.note("  %-4s %s -> 连续 %d 次都是人机验证页，判定被 CDN 拦截"
+                  % (method, url, attempts))
         return result
 
     def get(self, url, allow_redirects=True, retry_challenge=True):
@@ -388,6 +455,25 @@ class Session:
 
     def session_cookies(self):
         return [c.name for c in self.jar if c.name.lower().startswith(SESSION_COOKIE_PREFIX)]
+
+    # -- 诊断轨迹 -----------------------------------------------------------
+    def note(self, msg):
+        """诊断模式下追加一条轨迹；未开诊断时是空操作。"""
+        if self._trace_on:
+            self.trace.append(msg)
+
+    @staticmethod
+    def describe(url, data, r):
+        """把一次 HTTP 往返压成一行可读轨迹。"""
+        method = "POST" if data is not None else "GET"
+        line = "  %-4s %s -> HTTP %s" % (method, url, r["status"])
+        if r["url"] != url:
+            line += "  最终 %s" % r["url"]
+        line += "  %dB" % len(r["text"])
+        title = page_title(r["text"])
+        if title:
+            line += '  标题 "%s"' % title[:44]
+        return line
 
 
 # ---------------------------------------------------------------------------
@@ -407,9 +493,12 @@ def normalize_target(raw):
 # 主检测逻辑
 # ---------------------------------------------------------------------------
 
-def _result(name, status, method, detail, evidence=""):
-    return {"ip": name, "status": status, "method": method,
-            "detail": detail, "evidence": evidence}
+def _result(name, status, method, detail, evidence="", cred=""):
+    out = {"ip": name, "status": status, "method": method,
+           "detail": detail, "evidence": evidence}
+    if cred:
+        out["cred"] = cred
+    return out
 
 
 def probe_login_page(session, base):
@@ -440,6 +529,7 @@ def probe_login_page(session, base):
             continue
         if r["status"] == 401:
             saw_401 = True
+            session.note("  %s 返回 401，疑似 HTTP Basic 认证" % path)
             continue
         if r["status"] not in (200, 403):
             continue
@@ -453,8 +543,19 @@ def probe_login_page(session, base):
         # 严格门禁：URL 必须落在 LuCI 路径下，且要么有登录表单，
         # 要么同时具备 luci-static 资源引用 + LuCI 系标题。
         if fp["url_luci"] and (fp["login_form"] or (fp["static_ref"] and fp["title_luci"])):
+            fields = find_login_fields(html)
+            session.note("  命中登录页：请求 %s，实际落点 %s" % (path, r["url"]))
+            session.note("  指纹 LuCI路径=%s luci-static=%s 登录表单=%s LuCI标题=%s"
+                         % (_yn(fp["url_luci"]), _yn(fp["static_ref"]),
+                            _yn(fp["login_form"]), _yn(fp["title_luci"])))
+            if fields:
+                session.note("  识别到字段：用户名参数「%s」密码参数「%s」" % fields)
             return {"request_path": path, "login_url": r["url"],
                     "html": html, "fp": fp}, None
+
+        session.note("  跳过 %s：指纹不达标 LuCI路径=%s luci-static=%s 登录表单=%s LuCI标题=%s"
+                     % (path, _yn(fp["url_luci"]), _yn(fp["static_ref"]),
+                        _yn(fp["login_form"]), _yn(fp["title_luci"])))
 
     if saw_401:
         return None, "basic_auth"
@@ -470,53 +571,71 @@ def verify_session(session, base):
     阶段三：带会话回访受保护页，确认真的进了后台。
 
     这是整个判定的关键——不看关键词、不看文案，只看「登录态是否真的生效」：
-      1) 请求受保护页时不自动跟随跳转，先看是否被 302 弹回登录入口
-      2) 跟随后最终 URL 若停在登录入口 -> 未登录
-      3) 最终页面若仍是登录页 -> 未登录
-      4) 必须是 200 且是 LuCI 页面 -> 才算真登录成功
+      1) 直接跟随跳转，看最终落点是否被弹回登录入口
+      2) 最终页面若仍是登录页 -> 未登录
+      3) 必须是 200 且是 LuCI 页面 -> 才算真登录成功
+
+    性能上有两点刻意的设计：
+      - **一个候选只用 1 个请求**。早期版本先发一次 allow_redirects=False 看 302，
+        再发一次跟随跳转，等于同一个地址打两遍。直接跳转后判最终 URL 是等价的。
+      - **retry_challenge=False**。这里已经带着会话了，真被 CDN 拦，原地重试也过不去；
+        而每条候选各自退避重试的话，4 条候选最坏要等 4×12 = 48 秒。探测阶段已经
+        在规范路径上耐心等过一次了，这里不该再等。
+
     返回 (ok, detail, evidence)
     """
     tried = []
+    session.note("[阶段三] 带会话回访受保护页，确认登录态真的生效")
     for path in PROTECTED_CANDIDATES:
         url = base + path
         try:
-            r = session.get(url, allow_redirects=False)
+            r = session.get(url, allow_redirects=True, retry_challenge=False)
         except ConnectFailed:
             tried.append(path + ":请求异常")
+            session.note("  受保护页 %s 请求异常" % path)
             continue
 
-        if r["status"] in (301, 302, 303, 307, 308):
-            location = r["headers"].get("Location", "")
-            try:
-                r = session.get(urljoin(url, location), allow_redirects=True)
-            except ConnectFailed:
-                tried.append(path + ":跟随跳转异常")
-                continue
-            if _is_login_entry(r["url"]):
-                tried.append(path + ":被弹回登录入口")
-                continue
+        if _is_login_entry(r["url"]):
+            tried.append(path + ":被弹回登录入口")
+            session.note("  受保护页 %s 最终停在登录入口 %s，会话没生效"
+                         % (path, r["url"]))
+            continue
 
         if r["status"] != 200:
             tried.append("%s:HTTP %s" % (path, r["status"]))
+            session.note("  受保护页 %s 返回 HTTP %s，跳过" % (path, r["status"]))
             continue
 
         html = r["text"]
         if is_login_page(html):
             tried.append(path + ":仍是登录页")
+            session.note("  受保护页 %s 的内容仍然是登录页" % path)
             continue
         if not looks_like_luci_page(html, r["url"]):
             tried.append(path + ":非 LuCI 页面")
+            session.note("  受保护页 %s 拿到了 200，但不像 LuCI 页面"
+                         "（缺 /luci-static/ 资源引用或不含 LuCI 标题）" % path)
             continue
 
+        session.note("  受保护页 %s 确认已登录，会话真实有效" % path)
         return (True,
                 "会话有效（%s 返回后台内容）" % path,
                 "回访 %s 后返回后台内容，未弹回登录入口且无登录表单" % path)
 
+    session.note("  4 个受保护页候选全部未通过：%s" % "；".join(tried[:4]))
     return False, "会话无效：受保护页仍要求登录", "回访失败：" + "；".join(tried[:3])
 
 
-def try_login_and_verify(session, base, probe, username, password):
-    """阶段二 + 三：提交登录并验证会话。成败只由「会话是否真的生效」决定。"""
+def try_login_and_verify(session, base, probe, username, password, want_message=True):
+    """
+    阶段二 + 三：提交登录并验证会话。成败只由「会话是否真的生效」决定。
+
+    want_message 控制「失败时要不要再花一个请求去解析失败原因」：
+      - 自定义凭据模式（单次尝试）：True，失败原因值得说清楚
+      - 弱口令审计模式（最多 8 次尝试）：False，只关心「这组行不行」，
+        省下来的请求相当可观——7 次失败就是 7 个请求。
+    返回 (ok, detail, evidence)
+    """
     html = probe["html"]
     login_url = probe["login_url"]
 
@@ -526,10 +645,12 @@ def try_login_and_verify(session, base, probe, username, password):
     pwd_field = pwd_field or "luci_password"
 
     data = {}
+    hidden_names = []
     for d in parse_inputs(html):
         name = d.get("name", "")
         if name and d.get("type", "").lower() == "hidden":
             data[name] = d.get("value", "")
+            hidden_names.append(name)
 
     data[user_field] = username
     data[pwd_field] = password
@@ -537,12 +658,24 @@ def try_login_and_verify(session, base, probe, username, password):
     data.setdefault("luci_username", username)
     data.setdefault("luci_password", password)
 
+    session.note("[阶段二] 提交凭据 %s / %s 到 %s"
+                 % (username, password if password else "(空)", login_url))
+    session.note("  表单字段：用户名参数「%s」密码参数「%s」" % (user_field, pwd_field))
+    session.note("  附带隐藏域：%s" % ("、".join(hidden_names) if hidden_names else "无"))
+
     try:
-        resp = session.post(login_url, data, allow_redirects=True)
+        # 关键：不跟随跳转。登录成功后服务端会 302 到后台页，那个页面我们用不上，
+        # 跟过去纯属白发一个请求；真正要不要算成功由下面的回访验证说了算。
+        resp = session.post(login_url, data, allow_redirects=False)
     except ConnectFailed as e:
         return False, "-", "登录请求异常：%s" % str(e)[:40], ""
 
     cookies = session.session_cookies()
+    session.note("  登录响应 HTTP %s%s，sysauth* 会话 Cookie：%s"
+                 % (resp["status"],
+                    " -> %s" % resp["headers"].get("Location", "")
+                    if resp["status"] in (301, 302, 303, 307, 308) else "",
+                    "、".join(cookies) if cookies else "无"))
     if cookies:
         ok, detail, evidence = verify_session(session, base)
         if ok:
@@ -551,28 +684,49 @@ def try_login_and_verify(session, base, probe, username, password):
 
     # 没拿到 LuCI 会话凭据 —— 一定是失败。
     # 下面只决定「给人看的说明文案」，成败结论来自「没有会话」这个事实本身。
+    if not want_message:
+        return False, "LuCI表单", "未取得会话凭据", "响应未下发 sysauth* Cookie"
+
     # 优先用结构判据：登录后又被送回 LuCI 登录页，就是密码不对。
     # （实测某些固件认证失败时返回 HTTP 403 + 登录页，且页面上没有任何错误文案，
     #   只靠关键词会漏判，靠结构则稳定命中。）
-    resp_fp = fingerprint(resp["text"], resp["url"])
-    if is_login_page(resp["text"]) and resp_fp["static_ref"]:
+    body = resp["text"]
+    if resp["status"] in (301, 302, 303, 307, 308):
+        location = resp["headers"].get("Location", "")
+        try:
+            follow = session.get(urljoin(login_url, location), allow_redirects=True,
+                                 retry_challenge=False)
+            body = follow["text"]
+        except ConnectFailed:
+            body = ""
+    resp_fp = fingerprint(body, resp["url"])
+    if body and is_login_page(body) and resp_fp["static_ref"]:
+        session.note("  无会话 Cookie，且登录后又被送回 LuCI 登录页 -> 判定密码不对")
         return False, "LuCI表单", "密码错误", "登录后仍回到 LuCI 登录页，且未下发 sysauth* Cookie"
-    if has_fail_signal(resp["text"]):
+    if body and has_fail_signal(body):
+        session.note("  无会话 Cookie，但页面含明确的失败提示文案")
         return False, "LuCI表单", "密码错误", "登录响应含明确的失败提示"
+    session.note("  无会话 Cookie，响应里也没有明确的失败提示"
+                 "（可能是前端加密密码的固件，或字段名不匹配）")
     return False, "LuCI表单", "未取得 LuCI 会话凭据", "响应未下发 sysauth* Cookie"
 
 
-def try_basic_auth(base, username, password):
+def try_basic_auth(base, username, password, trace=None):
     """uhttpd Basic Auth 模式。凭据挂在 Session 上，回访验证的请求同样会带上。"""
-    session = Session(basic_auth=(base, username, password))
+    session = Session(basic_auth=(base, username, password), trace=trace)
+    session.note("[转为 HTTP Basic 认证流程]")
     try:
-        r = session.get(base + "/cgi-bin/luci/", allow_redirects=True)
+        r = session.get(base + "/cgi-bin/luci/", allow_redirects=True,
+                        retry_challenge=False)
     except ConnectFailed:
         return None
     if r["status"] == 401:
+        session.note("  带上 Basic 凭据后仍返回 401，用户名或密码不对")
         return None
 
     cookies = session.session_cookies()
+    session.note("  拿到 sysauth* 会话 Cookie：%s"
+                 % ("、".join(cookies) if cookies else "无"))
     if not cookies:
         return None
 
@@ -582,42 +736,174 @@ def try_basic_auth(base, username, password):
     return None
 
 
-def check_openwrt(raw, username, password, timeout=8):
-    """检测单个目标。"""
+def probe_target(raw, timeout=DEFAULT_PROBE_TIMEOUT, trace=None):
+    """
+    阶段 A · 探活：只判断「这台设备活着吗、上面是不是 LuCI」，完全不碰凭据。
+
+    这一步刻意用短超时：死主机在批量扫描里占多数，而默认 8 秒超时下
+    裸地址要付 http + https 两次，一台死机就是 16 秒。短超时 + 高并发之后，
+    死机几乎不占时间，贵的凭据尝试也只花在活得下来的设备上。
+
+    返回 {"ok": bool, ...}
+      ok=True  -> {"name", "base", "probe"|None, "basic", "direct"}
+      ok=False -> {"name", "result": 已经可以直接交付的失败结果}
+    """
     name, bases = normalize_target(raw)
-    last = _result(name, "fail", "-", "未找到 LuCI 登录页")
+    last = None
+    if trace is not None:
+        trace.append("[阶段A·探活] %s" % name)
+        trace.append("[候选地址] %s" % "、".join(bases))
 
     for base in bases:
-        session = Session(timeout=timeout)
+        session = Session(timeout=timeout, trace=trace)
+        if trace is not None:
+            trace.append("[阶段A] 探测 %s" % base)
         probe, reason = probe_login_page(session, base)
 
-        if probe is None:
-            if reason == "basic_auth":
-                got = try_basic_auth(base, username, password)
-                if got:
-                    method, detail, evidence = got
-                    return _result(name, "success", method, detail, evidence)
-                return _result(name, "fail", "BasicAuth", "Basic 认证失败",
-                               "用户名或密码错误")
-            if reason == "connect":
-                last = _result(name, "fail", "-", "连接失败", "端口不可达或连接超时")
-                continue        # http 连接失败时继续试 https
-            if reason == "challenge":
-                last = _result(name, "fail", "-", "被 CDN 人机验证拦截",
-                               "收到 Cloudflare 等 CDN 的验证挑战页，已重试 %d 次；"
-                               "不是设备问题，稍后重试或改用直连地址"
-                               % CHALLENGE_RETRIES)
-                break
-            return _result(name, "fail", "-", "未找到 LuCI 登录页",
-                           "页面不是 LuCI（无 /cgi-bin/luci 路径或登录表单）")
+        if probe is not None:
+            direct = not is_login_page(probe["html"])
+            if trace is not None:
+                trace.append("[阶段A] 通过 %s：%s" % (
+                    base, "拿到的已经是后台页，疑似无需密码" if direct else "是 LuCI 登录页"))
+            return {"ok": True, "name": name, "base": base,
+                    "probe": probe, "basic": False, "direct": direct}
 
-        ok, method, detail, evidence = try_login_and_verify(
-            session, base, probe, username, password)
+        if reason == "basic_auth":
+            if trace is not None:
+                trace.append("[阶段A] 通过 %s：需要 HTTP Basic 认证" % base)
+            return {"ok": True, "name": name, "base": base,
+                    "probe": None, "basic": True, "direct": False}
+
+        if reason == "connect":
+            last = _result(name, "fail", "-", "连接失败（超时或端口不可达）",
+                           "阶段A 探活未通过，未做凭据尝试")
+            if trace is not None:
+                trace.append("[阶段A] %s 连不上，换下一个候选地址" % base)
+            continue          # http 连不上时继续试 https（80 / 443 是不同端口）
+
+        if reason == "challenge":
+            last = _result(name, "fail", "-", "被 CDN 人机验证拦截",
+                           "挑战页重试 %d 次仍被拦，未做凭据尝试" % CHALLENGE_RETRIES)
+            break
+        last = _result(name, "fail", "-", "未找到 LuCI 登录页",
+                       "阶段A 判定不是 LuCI，未做凭据尝试")
+        break
+
+    return {"ok": False, "name": name, "result": last}
+
+
+def audit_target(info, creds, timeout=DEFAULT_AUDIT_TIMEOUT, trace=None):
+    """
+    阶段 B · 凭据审计：只对阶段 A 通过的目标跑凭据，按顺序尝试，命中即停。
+
+    返回带 cred 字段的结果（cred 就是命中的那组账号密码）。
+    """
+    name = info["name"]
+    base = info["base"]
+
+    # --- 情况 1：阶段 A 拿到的就是后台页，可能根本不需要密码 ---------------
+    # OpenWrt 出厂态是 root 无密码，很多设备干脆免密放行，这里 1 个请求就能定案。
+    if info.get("direct"):
+        session = Session(timeout=timeout, trace=trace)
+        if trace is not None:
+            trace.append("[阶段B] 探活拿到的就是后台页，先直接验证是否免密放行")
+        ok, _detail, evidence = verify_session(session, base)
         if ok:
-            return _result(name, "success", method, detail, evidence)
-        return _result(name, "fail", method, detail, evidence)
+            return _result(name, "success", "免密放行", NO_CRED_LABEL, evidence,
+                           cred=NO_CRED_LABEL)
+        if trace is not None:
+            trace.append("[阶段B] 免密放行验证未通过，转入凭据尝试")
 
-    return last
+    # --- 情况 2：uhttpd Basic Auth ----------------------------------------
+    if info.get("basic"):
+        for user, pw in creds:
+            got = try_basic_auth(base, user, pw, trace)
+            if got:
+                method, detail, evidence = got
+                return _result(name, "success", method, detail, evidence,
+                               cred="%s / %s" % (user, pw or "(空密码)"))
+        return _result(name, "fail", "BasicAuth",
+                       "弱口令均无法通过 Basic 认证（%d 组）" % len(creds),
+                       "已尝试 %d 组默认凭据" % len(creds))
+
+    # --- 情况 3：标准 LuCI 登录表单 ---------------------------------------
+    probe = info["probe"]
+    # 只有一组凭据（自定义模式）时才值得多花一个请求去解析失败原因；
+    # 弱口令模式最多 8 次尝试，每次都解析原因就是白白多 7 个请求。
+    want_message = len(creds) <= 1
+    session = Session(timeout=timeout, trace=trace)
+
+    last_detail = "未取得会话凭据"
+    last_evidence = "响应未下发 sysauth* Cookie"
+    for idx, (user, pw) in enumerate(creds, 1):
+        if trace is not None:
+            trace.append("[阶段B] 第 %d/%d 组：%s / %s"
+                         % (idx, len(creds), user, pw if pw else "(空密码)"))
+        ok, method, detail, evidence = try_login_and_verify(
+            session, base, probe, user, pw, want_message=want_message)
+        if ok:
+            return _result(name, "success", method, detail, evidence,
+                           cred="%s / %s" % (user, pw or "(空密码)"))
+        last_detail, last_evidence = detail, evidence
+
+    if len(creds) > 1:
+        return _result(name, "fail", "LuCI表单",
+                       "弱口令全部失败（已试 %d 组）" % len(creds),
+                       "已尝试 %d 组默认凭据，均未取得 sysauth* 会话" % len(creds))
+    return _result(name, "fail", "LuCI表单", last_detail, last_evidence)
+
+
+def check_openwrt(raw, username=None, password=None, timeout=DEFAULT_AUDIT_TIMEOUT,
+                  diagnose=False, creds=None):
+    """
+    单目标一站式检测（探活 + 凭据），保留给自测和单点排查用。
+    批量扫描请走 probe_target / audit_target 两阶段，不要用这个。
+
+    creds 给定时用它（弱口令模式）；否则用 username/password 这一组。
+    diagnose=True 时结果里会多一个 diag 字段：一条逐步诊断轨迹。
+    """
+    trace = [] if diagnose else None
+    if creds is None:
+        creds = [(username or "root", password or "")]
+
+    info = probe_target(raw, timeout=timeout, trace=trace)
+    if info["ok"]:
+        result = audit_target(info, creds, timeout=timeout, trace=trace)
+    else:
+        result = info["result"]
+
+    if diagnose and trace:
+        trace.append("[结论] %s —— %s%s" % (
+            "登录成功" if result["status"] == "success" else "失败",
+            result["detail"],
+            "；%s" % result["evidence"] if result.get("evidence") else ""))
+        result["diag"] = trace[:400]
+    return result
+
+
+# --- 两阶段批量的包装：把阶段 A 的轨迹一路带到阶段 B，诊断不断链 -----------
+
+def _probe_with_trace(raw, timeout, diagnose):
+    trace = [] if diagnose else None
+    info = probe_target(raw, timeout=timeout, trace=trace)
+    if diagnose:
+        info["trace"] = trace
+        if not info["ok"]:
+            trace.append("[结论] 失败 —— %s" % info["result"]["detail"])
+            info["result"]["diag"] = trace[:400]
+    return info
+
+
+def _audit_with_trace(info, creds, timeout, diagnose):
+    trace = info.get("trace") if diagnose else None
+    result = audit_target(info, creds, timeout=timeout, trace=trace)
+    if diagnose and trace:
+        trace.append("[结论] %s —— %s%s" % (
+            "登录成功" if result["status"] == "success" else "失败",
+            result["detail"],
+            "；%s" % result["evidence"] if result.get("evidence") else ""))
+        result["diag"] = trace[:400]
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -666,7 +952,8 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path
 
         if path in ("/", "/index.html"):
-            return self._send(200, INDEX_HTML)
+            return self._send(200, INDEX_HTML.replace(
+                "__WEAK_CREDS__", json.dumps(WEAK_CREDS, ensure_ascii=False)))
 
         if path.startswith("/api/status/"):
             return self.api_status(path.rsplit("/", 1)[-1],
@@ -694,24 +981,38 @@ class Handler(BaseHTTPRequestHandler):
         targets = [t.strip() for t in (payload.get("targets") or "").split("\n") if t.strip()]
         username = payload.get("username") or ""
         password = payload.get("password") or ""
+        diagnose = bool(payload.get("diagnose"))
+        mode = "custom" if payload.get("mode") == "custom" else "weak"
+
         try:
-            timeout = max(3, min(int(payload.get("timeout", 8)), 60))
+            audit_timeout = max(3, min(int(payload.get("timeout") or DEFAULT_AUDIT_TIMEOUT), 60))
+            probe_timeout = max(1, min(int(payload.get("probe_timeout") or DEFAULT_PROBE_TIMEOUT), 30))
             workers = max(1, min(int(payload.get("workers", 20)), 200))
         except (TypeError, ValueError):
             return self._json({"error": "超时/并发数必须是数字"}, 400)
 
-        if not targets or not username:
-            return self._json({"error": "请输入目标和用户名"}, 400)
+        if not targets:
+            return self._json({"error": "请输入目标列表"}, 400)
+
+        if mode == "custom":
+            if not username:
+                return self._json({"error": "自定义模式下请输入用户名"}, 400)
+            creds = [(username, password)]
+        else:
+            creds = list(WEAK_CREDS)
 
         _gc_tasks()
         task_id = uuid.uuid4().hex[:8]
         with tasks_lock:
             tasks[task_id] = {"results": [], "done": False, "cancel": False,
                               "success": 0, "fail": 0, "total": len(targets),
+                              "phase": "probe", "alive": 0, "audit_total": 0,
+                              "mode": mode, "cred_count": len(creds),
                               "started_at": time.time(), "finished_at": 0}
 
         threading.Thread(target=self._run_task,
-                         args=(task_id, targets, username, password, timeout, workers),
+                         args=(task_id, targets, creds, probe_timeout,
+                               audit_timeout, workers, diagnose),
                          daemon=True).start()
         return self._json({"task_id": task_id})
 
@@ -738,34 +1039,85 @@ class Handler(BaseHTTPRequestHandler):
                 "total": task["total"],
                 "success": task["success"],
                 "fail": task["fail"],
+                "phase": task.get("phase", "probe"),
+                "alive": task.get("alive", 0),
+                "audit_total": task.get("audit_total", 0),
+                "mode": task.get("mode", "weak"),
+                "cred_count": task.get("cred_count", 0),
             })
 
     @staticmethod
-    def _run_task(task_id, targets, username, password, timeout, workers):
+    def _push_result(task, result):
+        with tasks_lock:
+            if result["status"] == "success":
+                task["success"] += 1
+            else:
+                task["fail"] += 1
+            task["results"].append(result)
+
+    @staticmethod
+    def _run_task(task_id, targets, creds, probe_timeout, audit_timeout,
+                  workers, diagnose=False):
+        """
+        两阶段执行：
+          阶段 A 用短超时 + 高并发把全部目标探一遍，死机和非 LuCI 当场出结果；
+          阶段 B 只对活下来的设备跑凭据，命中即停。
+        这样贵的凭据尝试永远只花在值得花的目标上。
+        """
         with tasks_lock:
             task = tasks.get(task_id)
         if task is None:
             return
 
+        def cancelled():
+            with tasks_lock:
+                return bool(task["cancel"])
+
         pool = ThreadPoolExecutor(max_workers=workers)
         try:
-            futures = {pool.submit(check_openwrt, t, username, password, timeout): t
-                       for t in targets}
+            # ---------- 阶段 A：探活 ----------
+            futures = {
+                pool.submit(_probe_with_trace, t, probe_timeout, diagnose): t
+                for t in targets
+            }
+            alive = []
             for future in as_completed(futures):
-                with tasks_lock:
-                    if task["cancel"]:
-                        break
+                if cancelled():
+                    break
+                raw = futures[future]
                 try:
-                    result = future.result()
+                    info = future.result()
                 except Exception as e:
-                    result = _result(futures[future], "fail", "-",
-                                     "内部错误：%s" % str(e)[:40])
-                with tasks_lock:
-                    if result["status"] == "success":
-                        task["success"] += 1
-                    else:
-                        task["fail"] += 1
-                    task["results"].append(result)
+                    info = {"ok": False, "name": raw,
+                            "result": _result(raw, "fail", "-",
+                                              "内部错误：%s" % str(e)[:40])}
+                if info["ok"]:
+                    alive.append(info)
+                else:
+                    Handler._push_result(task, info["result"])
+
+            with tasks_lock:
+                task["phase"] = "audit"
+                task["alive"] = len(alive)
+                task["audit_total"] = len(alive)
+
+            # ---------- 阶段 B：凭据审计 ----------
+            if alive and not cancelled():
+                audit_futures = {
+                    pool.submit(_audit_with_trace, info, creds, audit_timeout,
+                                diagnose): info
+                    for info in alive
+                }
+                for future in as_completed(audit_futures):
+                    if cancelled():
+                        break
+                    info = audit_futures[future]
+                    try:
+                        result = future.result()
+                    except Exception as e:
+                        result = _result(info["name"], "fail", "-",
+                                         "内部错误：%s" % str(e)[:40])
+                    Handler._push_result(task, result)
         finally:
             try:
                 pool.shutdown(wait=False, cancel_futures=True)   # Python 3.9+
@@ -773,6 +1125,7 @@ class Handler(BaseHTTPRequestHandler):
                 pool.shutdown(wait=False)
             with tasks_lock:
                 task["done"] = True
+                task["phase"] = "done"
                 task["finished_at"] = time.time()
 
 
@@ -824,12 +1177,29 @@ tr:hover td { background: #1e2130; }
 @keyframes flashIn { from { background: #1a3a2a; } to { background: transparent; } }
 .running-indicator { display: inline-block; width: 8px; height: 8px; background: #4ade80; border-radius: 50%; margin-right: 6px; animation: pulse 1s infinite; }
 @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .3; } }
+.chk { display: flex; align-items: center; gap: 8px; font-size: 13px; color: #bbb; margin: 0; height: 41px; cursor: pointer; user-select: none; }
+.chk input[type=checkbox] { width: 16px; height: 16px; padding: 0; border: none; background: none; accent-color: #4a7dff; cursor: pointer; flex: none; }
+.chk:hover { color: #7eb8ff; }
+.diag { margin-top: 8px; }
+.diag-btn { background: #2a2d3a; color: #7eb8ff; border: 1px solid #3a3d4a; padding: 3px 9px; border-radius: 4px; cursor: pointer; font-size: 11px; font-family: inherit; }
+.diag-btn:hover { background: #3a3d4a; }
+.diag-pre { margin-top: 6px; padding: 8px 10px; background: #0d0f15; border: 1px solid #2a2d3a; border-radius: 6px; font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 11px; line-height: 1.7; color: #9aa3b2; white-space: pre-wrap; word-break: break-all; max-height: 340px; overflow: auto; }
+.modes { display: flex; gap: 10px; margin-bottom: 14px; }
+.mode { display: flex; align-items: center; gap: 7px; background: #12141c; border: 1px solid #2a2d3a; border-radius: 8px; padding: 9px 14px; font-size: 13px; color: #bbb; margin: 0; cursor: pointer; flex: 1; }
+.mode:hover { border-color: #3a3d4a; }
+.mode input { width: 15px; height: 15px; padding: 0; border: none; background: none; accent-color: #4a7dff; cursor: pointer; flex: none; }
+.mode.on { border-color: #4a7dff; color: #7eb8ff; background: #16203a; }
+.creds { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.creds span { background: #12141c; border: 1px solid #2a2d3a; border-radius: 5px; padding: 4px 9px; font-size: 12px; font-family: "SF Mono", Menlo, Consolas, monospace; color: #8fa6c8; }
+.creds span.hit { border-color: #2f6b4f; color: #4ade80; }
+.cred { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 12px; color: #4ade80; white-space: nowrap; }
+.phase { font-size: 12px; color: #7eb8ff; margin-bottom: 10px; }
 </style>
 </head>
 <body>
 <div class="container">
-  <h1>OpenWrt / LuCI 批量登录检测</h1>
-  <div class="sub">判定原则：必须拿到 sysauth 会话 + 回访后台页确认真登录成功；非 LuCI 页面一律判失败</div>
+  <h1>OpenWrt / LuCI 批量弱口令审计</h1>
+  <div class="sub">两阶段：先并发探活筛掉死机与非 LuCI，再只对活下来的设备跑凭据；必须拿到 sysauth 会话并回访后台页确认，才算登录成功</div>
 
   <div class="card">
     <label>目标列表（IP:端口 或 http(s)://IP:端口，每行一个）</label>
@@ -838,14 +1208,46 @@ tr:hover td { background: #1e2130; }
   </div>
 
   <div class="card">
-    <div class="row">
-      <div><label>用户名</label><input type="text" id="username" placeholder="root" value="root"></div>
-      <div><label>密码</label><input type="password" id="password" placeholder="密码"></div>
+    <div class="modes">
+      <label class="mode on" id="modeWeak"><input type="radio" name="mode" value="weak" checked> 弱口令审计（内置字典）</label>
+      <label class="mode" id="modeCustom"><input type="radio" name="mode" value="custom"> 自定义凭据</label>
     </div>
-    <div class="row">
-      <div><label>超时（秒）</label><input type="number" id="timeout" value="8" min="3" max="60"></div>
-      <div><label>并发数</label><input type="number" id="workers" value="20" min="1" max="200"></div>
+
+    <div id="weakBox">
+      <div class="hint">账号 <b>root / admin</b> × 密码 <b>空 / password / root / admin</b>，按命中率排序，命中一组立刻停止：</div>
+      <div class="creds" id="weakList"></div>
     </div>
+
+    <div id="customBox" class="hidden">
+      <div class="row">
+        <div><label>用户名</label><input type="text" id="username" placeholder="root" value="root"></div>
+        <div><label>密码</label><input type="password" id="password" placeholder="密码"></div>
+      </div>
+    </div>
+
+    <div class="row" style="margin-top:12px">
+      <div>
+        <label>探活超时（秒）</label>
+        <input type="number" id="probeTimeout" value="3" min="1" max="30">
+        <div class="hint">阶段 A：筛掉死主机</div>
+      </div>
+      <div>
+        <label>凭据超时（秒）</label>
+        <input type="number" id="timeout" value="8" min="3" max="60">
+        <div class="hint">阶段 B：只对活设备</div>
+      </div>
+      <div>
+        <label>并发数</label>
+        <input type="number" id="workers" value="20" min="1" max="200">
+        <div class="hint">两阶段共用</div>
+      </div>
+      <div>
+        <label>诊断模式</label>
+        <label class="chk"><input type="checkbox" id="diagnose"> 记录完整过程</label>
+        <div class="hint">排查陌生固件用</div>
+      </div>
+    </div>
+    <div class="hint">探活用短超时快速筛掉死主机（死亡设备常常占大多数，默认 8 秒超时下裸地址要付 http+https 两次，一台就是 16 秒）；凭据尝试很贵，所以只花在活下来的设备上。</div>
   </div>
 
   <button class="btn" id="startBtn" onclick="startCheck()">开始检测</button>
@@ -853,6 +1255,7 @@ tr:hover td { background: #1e2130; }
   <div id="resultArea" class="hidden" style="margin-top: 16px;">
     <div class="card">
       <div class="progress-bar"><div class="fill" id="progressFill" style="width:0%"></div></div>
+      <div class="phase" id="phaseLine"></div>
       <div class="stats">
         <div class="stat total"><div class="num" id="doneCount">0</div><div>已检测</div></div>
         <div class="stat success"><div class="num" id="successCount">0</div><div>成功</div></div>
@@ -860,7 +1263,7 @@ tr:hover td { background: #1e2130; }
       </div>
       <div class="toolbar">
         <span id="runStatus" style="font-size:13px;color:#888;"></span>
-        <button id="copyBtn" onclick="copySuccess()" class="hidden">复制成功列表</button>
+        <button id="copyBtn" onclick="copySuccess()" class="hidden">复制成功列表（含账号密码）</button>
         <button id="copyAllBtn" onclick="copyAll()" class="hidden">复制全部结果</button>
       </div>
     </div>
@@ -868,7 +1271,7 @@ tr:hover td { background: #1e2130; }
     <div class="card">
       <div class="result-table">
         <table>
-          <thead><tr><th style="width:44px">#</th><th style="width:190px">IP:端口</th><th style="width:100px">状态</th><th style="width:100px">方式</th><th style="width:190px">详情</th><th>判定依据</th></tr></thead>
+          <thead><tr><th style="width:40px">#</th><th style="width:165px">IP:端口</th><th style="width:80px">状态</th><th style="width:80px">方式</th><th style="width:140px">命中账号密码</th><th style="width:150px">详情</th><th>判定依据</th></tr></thead>
           <tbody id="resultBody"></tbody>
         </table>
       </div>
@@ -880,6 +1283,8 @@ tr:hover td { background: #1e2130; }
 let running = false, taskId = null, since = 0, timer = null, rowNum = 0;
 let successList = [], allResults = [];
 
+const WEAK_CREDS = __WEAK_CREDS__;
+
 function esc(s) {
   return String(s === undefined || s === null ? "" : s)
     .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -887,17 +1292,47 @@ function esc(s) {
 
 function setStatus(html) { document.getElementById("runStatus").innerHTML = html; }
 
+function currentMode() {
+  return document.querySelector('input[name="mode"]:checked').value;
+}
+
+function renderWeakList(hitCred) {
+  const box = document.getElementById("weakList");
+  box.innerHTML = WEAK_CREDS.map(function(c) {
+    const label = c[0] + " / " + (c[1] === "" ? "(空密码)" : c[1]);
+    const hit = hitCred && hitCred === label;
+    return '<span class="' + (hit ? "hit" : "") + '">' + esc(label) + '</span>';
+  }).join("");
+}
+
+function setupModes() {
+  document.querySelectorAll('input[name="mode"]').forEach(function(radio) {
+    radio.addEventListener("change", function() {
+      const weak = currentMode() === "weak";
+      document.getElementById("weakBox").classList.toggle("hidden", !weak);
+      document.getElementById("customBox").classList.toggle("hidden", weak);
+      document.getElementById("modeWeak").classList.toggle("on", weak);
+      document.getElementById("modeCustom").classList.toggle("on", !weak);
+      const c = document.getElementById("copyBtn");
+      c.textContent = weak ? "复制成功列表（含账号密码）" : "复制成功列表";
+    });
+  });
+}
+
 async function startCheck() {
   if (running) { stopCheck(true); return; }
 
   const targets = document.getElementById("targets").value.trim();
+  const mode = currentMode();
   const username = document.getElementById("username").value.trim();
   const password = document.getElementById("password").value;
+  const probeTimeout = document.getElementById("probeTimeout").value;
   const timeout = document.getElementById("timeout").value;
   const workers = document.getElementById("workers").value;
+  const diagnose = document.getElementById("diagnose").checked;
 
   if (!targets) return alert("请输入目标列表");
-  if (!username) return alert("请输入用户名");
+  if (mode === "custom" && !username) return alert("自定义模式下请输入用户名");
 
   running = true; since = 0; rowNum = 0; successList = []; allResults = [];
   document.getElementById("resultBody").innerHTML = "";
@@ -908,6 +1343,7 @@ async function startCheck() {
   document.getElementById("resultArea").classList.remove("hidden");
   document.getElementById("copyBtn").classList.add("hidden");
   document.getElementById("copyAllBtn").classList.add("hidden");
+  document.getElementById("phaseLine").textContent = "阶段 A · 正在探活…";
   setStatus('<span class="running-indicator"></span>检测中...');
   const btn = document.getElementById("startBtn");
   btn.textContent = "停止"; btn.classList.add("stop");
@@ -915,7 +1351,8 @@ async function startCheck() {
   try {
     const resp = await fetch("/api/check", {
       method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({targets, username, password, timeout, workers})
+      body: JSON.stringify({targets, username, password, mode, probe_timeout: probeTimeout,
+                            timeout, workers, diagnose})
     });
     const data = await resp.json();
     if (data.error) { alert(data.error); stopCheck(); return; }
@@ -943,6 +1380,13 @@ async function poll() {
     document.getElementById("progressFill").style.width =
       Math.round((d.success + d.fail) / Math.max(1, d.total) * 100) + "%";
 
+    if (!d.done) {
+      document.getElementById("phaseLine").textContent = (d.phase === "audit")
+        ? "阶段 B · 对 " + d.alive + "/" + d.total + " 台活设备跑凭据（"
+          + d.cred_count + " 组，命中即停）"
+        : "阶段 A · 正在探活 " + d.total + " 个目标…";
+    }
+
     if (d.done) { stopCheck(); return; }
     timer = setTimeout(poll, 300);
   } catch (e) {
@@ -956,16 +1400,32 @@ function addRow(r) {
   const tr = document.createElement("tr");
   tr.className = "new-row";
   const ok = r.status === "success";
+  const hasDiag = !!(r.diag && r.diag.length);
   tr.innerHTML =
     '<td class="mono">' + rowNum + '</td>' +
     '<td class="mono">' + esc(r.ip) + '</td>' +
     '<td><span class="badge ' + (ok ? 'ok' : 'no') + '">' + (ok ? '成功' : '失败') + '</span></td>' +
     '<td class="mono">' + esc(r.method) + '</td>' +
+    '<td class="cred">' + esc(r.cred || '—') + '</td>' +
     '<td>' + esc(r.detail) + '</td>' +
-    '<td class="ev">' + esc(r.evidence || '') + '</td>';
+    '<td class="ev">' + esc(r.evidence || '') +
+      (hasDiag
+        ? '<div class="diag"><button type="button" class="diag-btn">诊断 · ' + r.diag.length +
+          ' 步</button><pre class="diag-pre hidden">' + esc(r.diag.join("\n")) + '</pre></div>'
+        : '') +
+    '</td>';
+
+  const diagBtn = tr.querySelector(".diag-btn");
+  if (diagBtn) {
+    diagBtn.addEventListener("click", function() {
+      this.parentNode.querySelector(".diag-pre").classList.toggle("hidden");
+    });
+  }
+
   if (ok) {
     tr.dataset.ok = "1";
-    successList.push(r.ip);
+    successList.push(r.cred ? r.ip + "\t" + r.cred : r.ip);
+    if (r.cred) renderWeakList(r.cred);
     const firstFail = tbody.querySelector('tr[data-ok="0"]');
     if (firstFail) { tbody.insertBefore(tr, firstFail); } else { tbody.appendChild(tr); }
   } else {
@@ -981,16 +1441,20 @@ function stopCheck(sendStop) {
   const btn = document.getElementById("startBtn");
   btn.textContent = "开始检测"; btn.classList.remove("stop");
   setStatus("检测完成");
+  document.getElementById("phaseLine").textContent = "";
   if (successList.length > 0) document.getElementById("copyBtn").classList.remove("hidden");
   if (allResults.length > 0) document.getElementById("copyAllBtn").classList.remove("hidden");
 }
 
-function copySuccess() { copyText(successList.join("\n"), "copyBtn", "复制成功列表"); }
+function copySuccess() { copyText(successList.join("\n"), "copyBtn", "复制成功列表（含账号密码）"); }
 
 function copyAll() {
   const txt = allResults.map(function(r) {
-    return [(r.status === "success" ? "成功" : "失败"), r.ip, r.method, r.detail].join("\t");
-  }).join("\n");
+    var line = [(r.status === "success" ? "成功" : "失败"), r.ip, r.method,
+                r.cred || "", r.detail].join("\t");
+    if (r.diag && r.diag.length) line += "\n" + r.diag.join("\n");
+    return line;
+  }).join("\n\n");
   copyText(txt, "copyAllBtn", "复制全部结果");
 }
 
@@ -1001,6 +1465,9 @@ function copyText(text, btnId, label) {
     setTimeout(function() { btn.textContent = label; }, 1500);
   });
 }
+
+setupModes();
+renderWeakList(null);
 </script>
 </body>
 </html>
@@ -1052,6 +1519,13 @@ _SELFTEST_CHALLENGE = """<!doctype html><html class="no-js ie6 oldie" lang="en-U
 <script>window.__cf_chl_opt={cvId:'3'};</script></body></html>"""
 
 _SELFTEST_PW = "good-password"
+
+# 弱口令审计的模拟设备：模式 -> 唯一能登录成功的那组凭据（None 表示全部拒绝）
+_WEAK_MOCKS = {
+    "weak_empty": ("root", ""),         # 对应字典第 1 组
+    "weak_admin": ("admin", "admin"),   # 对应字典第 3 组
+    "weak_none": None,                  # 强口令设备，8 组全错
+}
 
 
 def _selftest_handler(mode):
@@ -1172,7 +1646,17 @@ def _selftest_handler(mode):
             n = int(self.headers.get("Content-Length") or 0)
             body = self.rfile.read(n).decode("utf-8", "ignore")
             q = parse_qs(body)
+            user = (q.get("luci_username") or q.get("username") or [""])[0]
             pwd = (q.get("luci_password") or q.get("password") or [""])[0]
+
+            # 弱口令审计专用模拟设备：只认某一组，用来验证「能否命中并报出正确凭据」
+            if m in _WEAK_MOCKS:
+                want = _WEAK_MOCKS[m]
+                if want is not None and (user, pwd) == want:
+                    return self._redir("/cgi-bin/luci/",
+                                       "sysauth=deadbeefcafe; Path=/; HttpOnly")
+                return self._out(403, _SELFTEST_LOGIN)
+
             if pwd == _SELFTEST_PW:
                 return self._redir("/cgi-bin/luci/", "sysauth=deadbeefcafe; Path=/; HttpOnly")
             login_html = _SELFTEST_LOGIN_CUSTOM if m == "luci_custom" else _SELFTEST_LOGIN
@@ -1189,55 +1673,93 @@ def run_selftest():
     CHALLENGE_RETRIES, CHALLENGE_DELAY = 3, 0.1     # 自测时缩短退避等待
 
     cases = [
-        ("fake", "非 LuCI 页面（含 openwrt/system/网络 泛词）", "fail"),
-        ("other_login", "非 LuCI 的普通登录页（不在 /cgi-bin/luci）", "fail"),
-        ("luci", "标准 LuCI 登录页 + 正确密码", "success"),
-        ("luci_stok", "LuCI 后台页要求 ;stok= 的版本 + 正确密码", "success"),
-        ("luci_custom", "自定义主题改名字段 + 正确密码", "success"),
-        ("luci", "标准 LuCI + 错误密码", "fail"),
-        ("luci_custom", "自定义主题 + 错误密码", "fail"),
-        ("luci_basic", "uhttpd Basic Auth 模式 + 正确密码", "success"),
-        ("luci_basic", "uhttpd Basic Auth 模式 + 错误密码", "fail"),
-        ("cf_retry", "CDN 挑战页后放行（退避重试应恢复正常）", "success"),
-        ("cf_block", "CDN 持续拦截（应判失败并说明原因）", "fail"),
+        # (模式, 说明, 期望结果, 用哪套凭据, 期望命中的那组凭据)
+        ("fake", "非 LuCI 页面（含 openwrt/system/网络 泛词）", "fail", "single", None),
+        ("other_login", "非 LuCI 的普通登录页（不在 /cgi-bin/luci）", "fail", "single", None),
+        ("luci", "标准 LuCI 登录页 + 正确密码", "success", "single", None),
+        ("luci_stok", "LuCI 后台页要求 ;stok= 的版本 + 正确密码", "success", "single", None),
+        ("luci_custom", "自定义主题改名字段 + 正确密码", "success", "single", None),
+        ("luci", "标准 LuCI + 错误密码", "fail", "single", None),
+        ("luci_custom", "自定义主题 + 错误密码", "fail", "single", None),
+        ("luci_basic", "uhttpd Basic Auth 模式 + 正确密码", "success", "single", None),
+        ("luci_basic", "uhttpd Basic Auth 模式 + 错误密码", "fail", "single", None),
+        ("cf_retry", "CDN 挑战页后放行（退避重试应恢复正常）", "success", "single", None),
+        ("cf_block", "CDN 持续拦截（应判失败并说明原因）", "fail", "single", None),
+        # --- 弱口令审计：验证「命中哪一组」也要报对 ---
+        ("weak_empty", "弱口令审计：设备只认 root + 空密码（字典第 1 组）",
+         "success", "weak", "root / (空密码)"),
+        ("weak_admin", "弱口令审计：设备只认 admin/admin（字典第 3 组）",
+         "success", "weak", "admin / admin"),
+        ("weak_none", "弱口令审计：强口令设备，8 组应全部失败",
+         "fail", "weak", None),
     ]
 
     # 每个用例起一个独立端口的模拟路由器（端口 0 = 由系统分配空闲端口）
     started = []
-    for mode, desc, expect in cases:
+    for mode, desc, expect, cred_mode, expect_cred in cases:
         srv = ThreadingHTTPServer(("127.0.0.1", 0), _selftest_handler(mode))
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         started.append({"mode": mode, "desc": desc, "expect": expect,
+                        "cred_mode": cred_mode, "expect_cred": expect_cred,
                         "port": srv.server_address[1], "srv": srv})
 
     print("=" * 96)
     print("本地自测：%d 个模拟目标（不需要路由器）" % len(started))
     print("=" * 96)
-    print("%-14s%-44s%-9s%-9s%s" % ("目标类型", "场景", "期望", "实际", "结论"))
+    print("%-14s%-42s%-9s%-9s%s" % ("目标类型", "场景", "期望", "实际", "结论"))
     print("-" * 96)
 
     bad = 0
+    diag_missing = 0
+    cred_wrong = 0
+    sample = None
     try:
         for c in started:
-            pwd = "bad-password" if "错误" in c["desc"] else _SELFTEST_PW
-            r = check_openwrt("127.0.0.1:%d" % c["port"], "root", pwd, timeout=5)
+            if c["cred_mode"] == "weak":
+                creds = list(WEAK_CREDS)
+            else:
+                pwd = "bad-password" if "错误" in c["desc"] else _SELFTEST_PW
+                creds = [("root", pwd)]
+            r = check_openwrt("127.0.0.1:%d" % c["port"],
+                              timeout=5, diagnose=True, creds=creds)
             ok = r["status"] == c["expect"]
+            if c["expect_cred"] is not None and r.get("cred") != c["expect_cred"]:
+                ok = False
+                cred_wrong += 1
             if not ok:
                 bad += 1
-            print("%-14s%-44s%-9s%-9s%s" % (
+            if not r.get("diag"):
+                diag_missing += 1
+            if sample is None and c["mode"] == "luci_custom":
+                sample = r
+            print("%-14s%-42s%-9s%-9s%s" % (
                 c["mode"], c["desc"], c["expect"], r["status"],
                 "通过" if ok else "不通过 <-- " + r["detail"]))
-            print("%-14s依据: %s" % ("", r.get("evidence") or r.get("detail")))
+            extra = ""
+            if r.get("cred"):
+                extra = "  命中凭据: %s" % r["cred"]
+            print("%-14s依据: %s%s" % ("", r.get("evidence") or r.get("detail"), extra))
     finally:
         for c in started:
             c["srv"].shutdown()
             c["srv"].server_close()
         CHALLENGE_RETRIES, CHALLENGE_DELAY = saved
 
+    if sample and sample.get("diag"):
+        print("-" * 96)
+        print("诊断模式样例（%s，共 %d 步）" % (sample["ip"], len(sample["diag"])))
+        print("-" * 96)
+        for line in sample["diag"]:
+            print(line)
+
     print("-" * 96)
+    print("诊断轨迹产出：%d / %d（缺失 %d）"
+          % (len(started) - diag_missing, len(started), diag_missing))
+    if cred_wrong:
+        print("命中凭据报错：%d 例" % cred_wrong)
     print("不符预期用例数：%d / %d" % (bad, len(started)))
     print("=" * 96)
-    return 0 if bad == 0 else 1
+    return 0 if (bad == 0 and diag_missing == 0) else 1
 
 
 # ---------------------------------------------------------------------------
