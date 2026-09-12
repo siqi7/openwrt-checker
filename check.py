@@ -493,11 +493,15 @@ def normalize_target(raw):
 # 主检测逻辑
 # ---------------------------------------------------------------------------
 
-def _result(name, status, method, detail, evidence="", cred=""):
+def _result(name, status, method, detail, evidence="", cred="", url="", autologin=None):
     out = {"ip": name, "status": status, "method": method,
            "detail": detail, "evidence": evidence}
     if cred:
         out["cred"] = cred
+    if url:
+        out["url"] = url          # 实际探测成功的地址，供界面「打开」按钮直达
+    if autologin:
+        out["autologin"] = autologin   # 浏览器免手动登录所需的表单动作 + 字段
     return out
 
 
@@ -624,6 +628,39 @@ def verify_session(session, base):
 
     session.note("  4 个受保护页候选全部未通过：%s" % "；".join(tried[:4]))
     return False, "会话无效：受保护页仍要求登录", "回访失败：" + "；".join(tried[:3])
+
+
+def build_autologin_form(probe, username, password):
+    """
+    生成「浏览器免手动登录」所需的表单信息：把登录表单原样搬到前端。
+
+    返回 {"action": 登录地址, "fields": {字段名: 值}}。字段取自登录页的隐藏域，
+    再加上用户名/密码；自定义主题改过字段名时，标准字段名也一并带上
+    （与 try_login_and_verify 的组包方式完全一致，保证点开就能登录）。
+
+    密码会随结果回到浏览器——这是免手动登录的前提。它与结果里本来就会显示的
+    命中凭据同等暴露，不会额外写日志或落盘。
+    """
+    html = probe["html"]
+    login_url = probe["login_url"]
+
+    fields = find_login_fields(html)
+    user_field, pwd_field = (fields if fields else (None, None))
+    user_field = user_field or "luci_username"
+    pwd_field = pwd_field or "luci_password"
+
+    data = {}
+    for d in parse_inputs(html):
+        name = d.get("name", "")
+        if name and d.get("type", "").lower() == "hidden":
+            data[name] = d.get("value", "")
+
+    data[user_field] = username
+    data[pwd_field] = password
+    data.setdefault("luci_username", username)
+    data.setdefault("luci_password", password)
+
+    return {"action": login_url, "fields": data}
 
 
 def try_login_and_verify(session, base, probe, username, password, want_message=True):
@@ -810,7 +847,7 @@ def audit_target(info, creds, timeout=DEFAULT_AUDIT_TIMEOUT, trace=None):
         ok, _detail, evidence = verify_session(session, base)
         if ok:
             return _result(name, "success", "免密放行", NO_CRED_LABEL, evidence,
-                           cred=NO_CRED_LABEL)
+                           cred=NO_CRED_LABEL, url=base)
         if trace is not None:
             trace.append("[阶段B] 免密放行验证未通过，转入凭据尝试")
 
@@ -821,7 +858,7 @@ def audit_target(info, creds, timeout=DEFAULT_AUDIT_TIMEOUT, trace=None):
             if got:
                 method, detail, evidence = got
                 return _result(name, "success", method, detail, evidence,
-                               cred="%s / %s" % (user, pw or "(空密码)"))
+                               cred="%s / %s" % (user, pw or "(空密码)"), url=base)
         return _result(name, "fail", "BasicAuth",
                        "弱口令均无法通过 Basic 认证（%d 组）" % len(creds),
                        "已尝试 %d 组默认凭据" % len(creds))
@@ -843,7 +880,8 @@ def audit_target(info, creds, timeout=DEFAULT_AUDIT_TIMEOUT, trace=None):
             session, base, probe, user, pw, want_message=want_message)
         if ok:
             return _result(name, "success", method, detail, evidence,
-                           cred="%s / %s" % (user, pw or "(空密码)"))
+                           cred="%s / %s" % (user, pw or "(空密码)"), url=base,
+                           autologin=build_autologin_form(probe, user, pw))
         last_detail, last_evidence = detail, evidence
 
     if len(creds) > 1:
@@ -1134,7 +1172,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>OpenWrt / LuCI 登录检测 v5</title>
+<title>OpenWrt / LuCI 批量弱口令审计 v5</title>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; background: #0f1117; color: #e0e0e0; min-height: 100vh; }
@@ -1193,6 +1231,10 @@ tr:hover td { background: #1e2130; }
 .creds span { background: #12141c; border: 1px solid #2a2d3a; border-radius: 5px; padding: 4px 9px; font-size: 12px; font-family: "SF Mono", Menlo, Consolas, monospace; color: #8fa6c8; }
 .creds span.hit { border-color: #2f6b4f; color: #4ade80; }
 .cred { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 12px; color: #4ade80; white-space: nowrap; }
+.open-btn { display: inline-block; padding: 3px 9px; border-radius: 4px; background: #16203a; border: 1px solid #4a7dff; color: #7eb8ff; font-size: 11px; font-weight: 600; text-decoration: none; white-space: nowrap; }
+.open-btn:hover { background: #22305a; color: #a8ccff; }
+.open-btn.auto-btn { background: #14321f; border-color: #2f6b4f; color: #7ae0a1; cursor: pointer; font-family: inherit; }
+.open-btn.auto-btn:hover { background: #1b4530; color: #a4f0c4; }
 .phase { font-size: 12px; color: #7eb8ff; margin-bottom: 10px; }
 </style>
 </head>
@@ -1263,6 +1305,7 @@ tr:hover td { background: #1e2130; }
       </div>
       <div class="toolbar">
         <span id="runStatus" style="font-size:13px;color:#888;"></span>
+        <button id="openAllBtn" onclick="openAllSuccess()" class="hidden">打开全部成功</button>
         <button id="copyBtn" onclick="copySuccess()" class="hidden">复制成功列表（含账号密码）</button>
         <button id="copyAllBtn" onclick="copyAll()" class="hidden">复制全部结果</button>
       </div>
@@ -1271,7 +1314,7 @@ tr:hover td { background: #1e2130; }
     <div class="card">
       <div class="result-table">
         <table>
-          <thead><tr><th style="width:40px">#</th><th style="width:165px">IP:端口</th><th style="width:80px">状态</th><th style="width:80px">方式</th><th style="width:140px">命中账号密码</th><th style="width:150px">详情</th><th>判定依据</th></tr></thead>
+          <thead><tr><th style="width:40px">#</th><th style="width:165px">IP:端口</th><th style="width:72px">打开</th><th style="width:80px">状态</th><th style="width:80px">方式</th><th style="width:140px">命中账号密码</th><th style="width:150px">详情</th><th>判定依据</th></tr></thead>
           <tbody id="resultBody"></tbody>
         </table>
       </div>
@@ -1281,13 +1324,17 @@ tr:hover td { background: #1e2130; }
 
 <script>
 let running = false, taskId = null, since = 0, timer = null, rowNum = 0;
-let successList = [], allResults = [];
+let successList = [], allResults = [], successTargets = [];
 
 const WEAK_CREDS = __WEAK_CREDS__;
 
 function esc(s) {
   return String(s === undefined || s === null ? "" : s)
     .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function escAttr(s) {
+  return esc(s).replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 
 function setStatus(html) { document.getElementById("runStatus").innerHTML = html; }
@@ -1334,7 +1381,7 @@ async function startCheck() {
   if (!targets) return alert("请输入目标列表");
   if (mode === "custom" && !username) return alert("自定义模式下请输入用户名");
 
-  running = true; since = 0; rowNum = 0; successList = []; allResults = [];
+  running = true; since = 0; rowNum = 0; successList = []; allResults = []; successTargets = [];
   document.getElementById("resultBody").innerHTML = "";
   document.getElementById("doneCount").textContent = "0";
   document.getElementById("successCount").textContent = "0";
@@ -1343,6 +1390,7 @@ async function startCheck() {
   document.getElementById("resultArea").classList.remove("hidden");
   document.getElementById("copyBtn").classList.add("hidden");
   document.getElementById("copyAllBtn").classList.add("hidden");
+  document.getElementById("openAllBtn").classList.add("hidden");
   document.getElementById("phaseLine").textContent = "阶段 A · 正在探活…";
   setStatus('<span class="running-indicator"></span>检测中...');
   const btn = document.getElementById("startBtn");
@@ -1401,9 +1449,16 @@ function addRow(r) {
   tr.className = "new-row";
   const ok = r.status === "success";
   const hasDiag = !!(r.diag && r.diag.length);
+  const openUrl = ok && r.url ? r.url : "";
+  const autoForm = (ok && r.autologin && r.autologin.action) ? r.autologin : null;
+  const openCell = !openUrl ? ""
+      : (autoForm
+          ? '<button type="button" class="open-btn auto-btn">打开并登录</button>'
+          : '<a class="open-btn" href="' + escAttr(openUrl) + '" target="_blank" rel="noopener noreferrer">打开 ↗</a>');
   tr.innerHTML =
     '<td class="mono">' + rowNum + '</td>' +
     '<td class="mono">' + esc(r.ip) + '</td>' +
+    '<td>' + openCell + '</td>' +
     '<td><span class="badge ' + (ok ? 'ok' : 'no') + '">' + (ok ? '成功' : '失败') + '</span></td>' +
     '<td class="mono">' + esc(r.method) + '</td>' +
     '<td class="cred">' + esc(r.cred || '—') + '</td>' +
@@ -1415,6 +1470,11 @@ function addRow(r) {
         : '') +
     '</td>';
 
+  const autoBtn = tr.querySelector(".auto-btn");
+  if (autoBtn) {
+    autoBtn.addEventListener("click", function() { autoLoginForm(autoForm); });
+  }
+
   const diagBtn = tr.querySelector(".diag-btn");
   if (diagBtn) {
     diagBtn.addEventListener("click", function() {
@@ -1425,6 +1485,8 @@ function addRow(r) {
   if (ok) {
     tr.dataset.ok = "1";
     successList.push(r.cred ? r.ip + "\t" + r.cred : r.ip);
+    if (openUrl) successTargets.push({url: openUrl, autologin: autoForm, ip: r.ip});
+    refreshOpenAll();
     if (r.cred) renderWeakList(r.cred);
     const firstFail = tbody.querySelector('tr[data-ok="0"]');
     if (firstFail) { tbody.insertBefore(tr, firstFail); } else { tbody.appendChild(tr); }
@@ -1444,6 +1506,59 @@ function stopCheck(sendStop) {
   document.getElementById("phaseLine").textContent = "";
   if (successList.length > 0) document.getElementById("copyBtn").classList.remove("hidden");
   if (allResults.length > 0) document.getElementById("copyAllBtn").classList.remove("hidden");
+  refreshOpenAll();
+}
+
+function refreshOpenAll() {
+  const b = document.getElementById("openAllBtn");
+  if (!b) return;
+  if (successTargets.length > 0) {
+    const canAuto = successTargets.some(function(t) { return t.autologin; });
+    b.classList.remove("hidden");
+    b.textContent = (canAuto ? "打开全部并登录（" : "打开全部成功（") + successTargets.length + "）";
+  } else {
+    b.classList.add("hidden");
+  }
+}
+
+function autoLoginForm(formInfo) {
+  if (!formInfo || !formInfo.action) return;
+  const f = document.createElement("form");
+  f.method = "POST";
+  f.action = formInfo.action;
+  f.target = "_blank";
+  f.style.display = "none";
+  const fields = formInfo.fields || {};
+  Object.keys(fields).forEach(function(k) {
+    const i = document.createElement("input");
+    i.type = "hidden";
+    i.name = k;
+    i.value = fields[k];
+    f.appendChild(i);
+  });
+  document.body.appendChild(f);
+  f.submit();
+  setTimeout(function() { if (f.parentNode) f.parentNode.removeChild(f); }, 3000);
+}
+
+function openAllSuccess() {
+  if (!successTargets.length) return;
+  const autoN = successTargets.filter(function(t) { return t.autologin; }).length;
+  const tip = autoN ? "其中 " + autoN + " 个会自动用命中凭据登录。" : "";
+  if (successTargets.length > 1 &&
+      !confirm("即将尝试打开 " + successTargets.length + " 个设备后台。\n" + tip +
+               "\n浏览器通常会拦截批量弹窗，可能只放行第一个。\n" +
+               "被拦截时请用每行的按钮逐个进入。\n\n继续？")) return;
+  let blocked = 0;
+  successTargets.forEach(function(t) {
+    if (t.autologin) {
+      autoLoginForm(t.autologin);
+    } else if (!window.open(t.url, "_blank", "noopener")) {
+      blocked++;
+    }
+  });
+  setStatus("已尝试打开 " + successTargets.length + " 个设备" +
+            (blocked ? '<span style="color:#f87171">（' + blocked + " 个被浏览器弹窗拦截）</span>" : ""));
 }
 
 function copySuccess() { copyText(successList.join("\n"), "copyBtn", "复制成功列表（含账号密码）"); }
@@ -1808,7 +1923,7 @@ def serve(host, port):
     httpd.daemon_threads = True
 
     print("=" * 62)
-    print("  OpenWrt / LuCI 批量登录检测  (%s)" % VERSION)
+    print("  OpenWrt / LuCI 批量弱口令审计  (%s)" % VERSION)
     print("=" * 62)
     print("  已监听    %s:%d" % (host, port))
     print("  本机访问  http://127.0.0.1:%d/" % port)
@@ -1832,7 +1947,7 @@ def serve(host, port):
 
 def main():
     ap = argparse.ArgumentParser(
-        description="OpenWrt / LuCI 批量登录检测（Linux 零依赖单文件版）")
+        description="OpenWrt / LuCI 批量弱口令审计（Linux 零依赖单文件版）")
     ap.add_argument("--host", default=os.environ.get("OPENWRT_CHECKER_HOST", DEFAULT_HOST),
                     help="监听地址，默认 0.0.0.0")
     ap.add_argument("--port", type=int,

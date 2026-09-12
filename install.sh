@@ -1,5 +1,5 @@
 #!/bin/bash
-# OpenWrt / LuCI 批量登录检测 —— Linux 一键安装为 systemd 服务
+# OpenWrt / LuCI 批量弱口令审计 —— Linux 一键安装为 systemd 服务
 #
 # 用法：
 #   sudo ./install.sh              安装并立即启动（开机自启）
@@ -60,7 +60,7 @@ echo
 
 # --- 2. 生成 unit 内容 -----------------------------------------------------
 UNIT_CONTENT="[Unit]
-Description=OpenWrt / LuCI 批量登录检测 ${PORT}
+Description=OpenWrt / LuCI 批量弱口令审计 ${PORT}
 Documentation=file://${DIR}/check.py
 After=network-online.target
 Wants=network-online.target

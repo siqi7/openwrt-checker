@@ -1,5 +1,5 @@
 #!/bin/sh
-# OpenWrt / LuCI 批量登录检测 —— 前台快速启动（不需要 systemd / 不需要 root）
+# OpenWrt / LuCI 批量弱口令审计 —— 前台快速启动（不需要 systemd / 不需要 root）
 #
 # 用法：
 #   ./run.sh                 监听 0.0.0.0:5678

@@ -1,4 +1,4 @@
-# OpenWrt / LuCI 批量登录检测 —— systemd 服务模板
+# OpenWrt / LuCI 批量弱口令审计 —— systemd 服务模板
 #
 # 这是参考示例，路径按 /opt/openwrt-checker 写死。
 # 如果你的安装目录不是这个，请直接跑 ./install.sh，它会自动生成正确路径的

@@ -1,5 +1,5 @@
 #!/bin/sh
-# OpenWrt / LuCI 批量登录检测 —— 一键下载并运行
+# OpenWrt / LuCI 批量弱口令审计 —— 一键下载并运行
 #
 # 直接用（前台运行，不需要 root，不需要装任何依赖）：
 #   curl -fsSL https://raw.githubusercontent.com/siqi7/openwrt-checker/master/get.sh | sh
@@ -40,7 +40,7 @@ else
 fi
 
 echo "=========================================="
-echo "  OpenWrt / LuCI 批量登录检测"
+echo "  OpenWrt / LuCI 批量弱口令审计"
 echo "=========================================="
 echo "  来源    ${REPO} (${BRANCH})"
 echo "  安装到  ${DEST}"
