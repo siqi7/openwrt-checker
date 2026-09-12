@@ -19,6 +19,7 @@ OpenWrt / LuCI 批量弱口令审计工具 —— Linux 零依赖单文件版 (v
   python3 check.py                     监听 0.0.0.0:5678
   python3 check.py --port 8080         换端口
   python3 check.py --host 127.0.0.1    只监听本机
+  python3 check.py --stop               停掉本工具的旧实例（端口被占用时用）
   python3 check.py --selftest           本地自测（不需要路由器）
 """
 
@@ -29,8 +30,10 @@ import http.cookiejar
 import json
 import os
 import re
+import signal
 import socket
 import ssl
+import subprocess
 import sys
 import threading
 import time
@@ -53,7 +56,9 @@ from urllib.parse import urlparse, urljoin, parse_qs
 
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 5678
-VERSION = "5.2-linux"
+VERSION = "5.3-linux"
+# 进程信息根目录。Linux 是 /proc；测试可指向夹具目录。
+PROC_ROOT = os.environ.get("OPENWRT_CHECKER_PROC", "/proc")
 
 USER_AGENT = ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
@@ -493,15 +498,13 @@ def normalize_target(raw):
 # 主检测逻辑
 # ---------------------------------------------------------------------------
 
-def _result(name, status, method, detail, evidence="", cred="", url="", autologin=None):
+def _result(name, status, method, detail, evidence="", cred="", url=""):
     out = {"ip": name, "status": status, "method": method,
            "detail": detail, "evidence": evidence}
     if cred:
         out["cred"] = cred
     if url:
         out["url"] = url          # 实际探测成功的地址，供界面「打开」按钮直达
-    if autologin:
-        out["autologin"] = autologin   # 浏览器免手动登录所需的表单动作 + 字段
     return out
 
 
@@ -628,39 +631,6 @@ def verify_session(session, base):
 
     session.note("  4 个受保护页候选全部未通过：%s" % "；".join(tried[:4]))
     return False, "会话无效：受保护页仍要求登录", "回访失败：" + "；".join(tried[:3])
-
-
-def build_autologin_form(probe, username, password):
-    """
-    生成「浏览器免手动登录」所需的表单信息：把登录表单原样搬到前端。
-
-    返回 {"action": 登录地址, "fields": {字段名: 值}}。字段取自登录页的隐藏域，
-    再加上用户名/密码；自定义主题改过字段名时，标准字段名也一并带上
-    （与 try_login_and_verify 的组包方式完全一致，保证点开就能登录）。
-
-    密码会随结果回到浏览器——这是免手动登录的前提。它与结果里本来就会显示的
-    命中凭据同等暴露，不会额外写日志或落盘。
-    """
-    html = probe["html"]
-    login_url = probe["login_url"]
-
-    fields = find_login_fields(html)
-    user_field, pwd_field = (fields if fields else (None, None))
-    user_field = user_field or "luci_username"
-    pwd_field = pwd_field or "luci_password"
-
-    data = {}
-    for d in parse_inputs(html):
-        name = d.get("name", "")
-        if name and d.get("type", "").lower() == "hidden":
-            data[name] = d.get("value", "")
-
-    data[user_field] = username
-    data[pwd_field] = password
-    data.setdefault("luci_username", username)
-    data.setdefault("luci_password", password)
-
-    return {"action": login_url, "fields": data}
 
 
 def try_login_and_verify(session, base, probe, username, password, want_message=True):
@@ -880,8 +850,7 @@ def audit_target(info, creds, timeout=DEFAULT_AUDIT_TIMEOUT, trace=None):
             session, base, probe, user, pw, want_message=want_message)
         if ok:
             return _result(name, "success", method, detail, evidence,
-                           cred="%s / %s" % (user, pw or "(空密码)"), url=base,
-                           autologin=build_autologin_form(probe, user, pw))
+                           cred="%s / %s" % (user, pw or "(空密码)"), url=base)
         last_detail, last_evidence = detail, evidence
 
     if len(creds) > 1:
@@ -1233,8 +1202,6 @@ tr:hover td { background: #1e2130; }
 .cred { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 12px; color: #4ade80; white-space: nowrap; }
 .open-btn { display: inline-block; padding: 3px 9px; border-radius: 4px; background: #16203a; border: 1px solid #4a7dff; color: #7eb8ff; font-size: 11px; font-weight: 600; text-decoration: none; white-space: nowrap; }
 .open-btn:hover { background: #22305a; color: #a8ccff; }
-.open-btn.auto-btn { background: #14321f; border-color: #2f6b4f; color: #7ae0a1; cursor: pointer; font-family: inherit; }
-.open-btn.auto-btn:hover { background: #1b4530; color: #a4f0c4; }
 .phase { font-size: 12px; color: #7eb8ff; margin-bottom: 10px; }
 </style>
 </head>
@@ -1324,7 +1291,7 @@ tr:hover td { background: #1e2130; }
 
 <script>
 let running = false, taskId = null, since = 0, timer = null, rowNum = 0;
-let successList = [], allResults = [], successTargets = [];
+let successList = [], allResults = [], successUrls = [];
 
 const WEAK_CREDS = __WEAK_CREDS__;
 
@@ -1381,7 +1348,7 @@ async function startCheck() {
   if (!targets) return alert("请输入目标列表");
   if (mode === "custom" && !username) return alert("自定义模式下请输入用户名");
 
-  running = true; since = 0; rowNum = 0; successList = []; allResults = []; successTargets = [];
+  running = true; since = 0; rowNum = 0; successList = []; allResults = []; successUrls = [];
   document.getElementById("resultBody").innerHTML = "";
   document.getElementById("doneCount").textContent = "0";
   document.getElementById("successCount").textContent = "0";
@@ -1450,11 +1417,9 @@ function addRow(r) {
   const ok = r.status === "success";
   const hasDiag = !!(r.diag && r.diag.length);
   const openUrl = ok && r.url ? r.url : "";
-  const autoForm = (ok && r.autologin && r.autologin.action) ? r.autologin : null;
-  const openCell = !openUrl ? ""
-      : (autoForm
-          ? '<button type="button" class="open-btn auto-btn">打开并登录</button>'
-          : '<a class="open-btn" href="' + escAttr(openUrl) + '" target="_blank" rel="noopener noreferrer">打开 ↗</a>');
+  const openCell = openUrl
+      ? '<a class="open-btn" href="' + escAttr(openUrl) + '" target="_blank" rel="noopener noreferrer">打开 ↗</a>'
+      : "";
   tr.innerHTML =
     '<td class="mono">' + rowNum + '</td>' +
     '<td class="mono">' + esc(r.ip) + '</td>' +
@@ -1470,11 +1435,6 @@ function addRow(r) {
         : '') +
     '</td>';
 
-  const autoBtn = tr.querySelector(".auto-btn");
-  if (autoBtn) {
-    autoBtn.addEventListener("click", function() { autoLoginForm(autoForm); });
-  }
-
   const diagBtn = tr.querySelector(".diag-btn");
   if (diagBtn) {
     diagBtn.addEventListener("click", function() {
@@ -1485,7 +1445,7 @@ function addRow(r) {
   if (ok) {
     tr.dataset.ok = "1";
     successList.push(r.cred ? r.ip + "\t" + r.cred : r.ip);
-    if (openUrl) successTargets.push({url: openUrl, autologin: autoForm, ip: r.ip});
+    if (openUrl) successUrls.push(openUrl);
     refreshOpenAll();
     if (r.cred) renderWeakList(r.cred);
     const firstFail = tbody.querySelector('tr[data-ok="0"]');
@@ -1512,52 +1472,25 @@ function stopCheck(sendStop) {
 function refreshOpenAll() {
   const b = document.getElementById("openAllBtn");
   if (!b) return;
-  if (successTargets.length > 0) {
-    const canAuto = successTargets.some(function(t) { return t.autologin; });
+  if (successUrls.length > 0) {
     b.classList.remove("hidden");
-    b.textContent = (canAuto ? "打开全部并登录（" : "打开全部成功（") + successTargets.length + "）";
+    b.textContent = "打开全部成功（" + successUrls.length + "）";
   } else {
     b.classList.add("hidden");
   }
 }
 
-function autoLoginForm(formInfo) {
-  if (!formInfo || !formInfo.action) return;
-  const f = document.createElement("form");
-  f.method = "POST";
-  f.action = formInfo.action;
-  f.target = "_blank";
-  f.style.display = "none";
-  const fields = formInfo.fields || {};
-  Object.keys(fields).forEach(function(k) {
-    const i = document.createElement("input");
-    i.type = "hidden";
-    i.name = k;
-    i.value = fields[k];
-    f.appendChild(i);
-  });
-  document.body.appendChild(f);
-  f.submit();
-  setTimeout(function() { if (f.parentNode) f.parentNode.removeChild(f); }, 3000);
-}
-
 function openAllSuccess() {
-  if (!successTargets.length) return;
-  const autoN = successTargets.filter(function(t) { return t.autologin; }).length;
-  const tip = autoN ? "其中 " + autoN + " 个会自动用命中凭据登录。" : "";
-  if (successTargets.length > 1 &&
-      !confirm("即将尝试打开 " + successTargets.length + " 个设备后台。\n" + tip +
-               "\n浏览器通常会拦截批量弹窗，可能只放行第一个。\n" +
-               "被拦截时请用每行的按钮逐个进入。\n\n继续？")) return;
+  if (!successUrls.length) return;
+  if (successUrls.length > 1 &&
+      !confirm("即将尝试打开 " + successUrls.length + " 个设备后台。\n\n" +
+               "浏览器通常会拦截批量弹窗，可能只放行第一个。\n" +
+               "被拦截时请用每行的「打开」按钮逐个进入。\n\n继续？")) return;
   let blocked = 0;
-  successTargets.forEach(function(t) {
-    if (t.autologin) {
-      autoLoginForm(t.autologin);
-    } else if (!window.open(t.url, "_blank", "noopener")) {
-      blocked++;
-    }
+  successUrls.forEach(function(u) {
+    if (!window.open(u, "_blank", "noopener")) blocked++;
   });
-  setStatus("已尝试打开 " + successTargets.length + " 个设备" +
+  setStatus("已尝试打开 " + successUrls.length + " 个设备" +
             (blocked ? '<span style="color:#f87171">（' + blocked + " 个被浏览器弹窗拦截）</span>" : ""));
 }
 
@@ -1912,13 +1845,232 @@ def local_ips():
     return ips
 
 
+# ---------------------------------------------------------------------------
+# 进程与端口：为什么「停不掉」、以及怎么处理
+# ---------------------------------------------------------------------------
+
+def _install_signal_handlers():
+    """
+    显式安装退出信号处理器。
+
+    为什么必须显式装：Python 只在 SIGINT 的处置为「默认」时才安装自己的
+    KeyboardInterrupt 处理器。如果进程是在非交互环境里被拉起来的
+    （后台 `&`、管道、某些 Web 终端 / 面板 / 容器），启动时 SIGINT 会被设成
+    「忽略」，Python 会原样继承这个忽略 —— 于是 Ctrl+C 毫无反应，进程一直
+    占着端口，只能换个端口重启。
+    这里用 signal.signal() 显式覆盖继承来的 SIG_IGN，让 Ctrl+C / SIGTERM
+    在任何启动方式下都能干净退出。
+    """
+    def _on_exit(signum, frame):
+        raise KeyboardInterrupt
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, _on_exit)
+        except (ValueError, OSError, AttributeError):
+            pass            # 非主线程 / 平台不支持
+
+
+def _pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def _proc_cmdline(pid):
+    """取进程命令行，取不到返回空串。Linux 走 /proc，其它平台走 ps。"""
+    try:
+        with open(os.path.join(PROC_ROOT, "%d" % pid, "cmdline"), "rb") as f:
+            raw = f.read()
+        if raw:
+            return " ".join(p.decode("utf-8", "replace")
+                            for p in raw.split(b"\0") if p)
+    except OSError:
+        pass
+    try:
+        out = subprocess.run(["ps", "-p", str(pid), "-o", "args="],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             timeout=5)
+        return out.stdout.decode("utf-8", "replace").strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def _iter_pids():
+    """产出系统进程 PID。Linux 走 /proc（无外部依赖），其它平台走 ps。"""
+    try:
+        names = os.listdir(PROC_ROOT)
+    except OSError:
+        names = None
+    if names is not None:
+        for name in names:
+            if name.isdigit():
+                yield int(name)
+        return
+    try:
+        out = subprocess.run(["ps", "-eo", "pid="],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             timeout=5)
+        for tok in out.stdout.decode("utf-8", "replace").split():
+            if tok.isdigit():
+                yield int(tok)
+    except (OSError, subprocess.SubprocessError):
+        return
+
+
+def _pids_listening_on(port):
+    """
+    找出正在 LISTEN 该 TCP 端口的 PID。
+    Linux 直接读 /proc（不依赖 lsof）；拿不到再回退 lsof。
+    """
+    pids = set()
+    inodes = set()
+
+    for name in ("net/tcp", "net/tcp6"):
+        path = os.path.join(PROC_ROOT, name)
+        try:
+            f = open(path)
+        except OSError:
+            continue
+        with f:
+            next(f, None)                           # 跳过表头
+            for line in f:
+                parts = line.split()
+                if len(parts) < 10:
+                    continue
+                local, state, inode = parts[1], parts[3], parts[9]
+                if state != "0A":                   # 0A = LISTEN
+                    continue
+                try:
+                    if int(local.rsplit(":", 1)[-1], 16) != port:
+                        continue
+                except ValueError:
+                    continue
+                inodes.add(inode)
+
+    if inodes:
+        want = {"socket:[%s]" % i for i in inodes}
+        for pid in _iter_pids():
+            fd_dir = os.path.join(PROC_ROOT, "%d" % pid, "fd")
+            try:
+                fds = os.listdir(fd_dir)
+            except OSError:
+                continue
+            for fd in fds:
+                try:
+                    if os.readlink(os.path.join(fd_dir, fd)) in want:
+                        pids.add(pid)
+                        break
+                except OSError:
+                    continue
+
+    if not pids:
+        try:
+            out = subprocess.run(["lsof", "-nP", "-ti", "tcp:%d" % port,
+                                  "-sTCP:LISTEN"],
+                                 stdout=subprocess.PIPE,
+                                 stderr=subprocess.DEVNULL, timeout=5)
+            for tok in out.stdout.decode("utf-8", "replace").split():
+                if tok.isdigit():
+                    pids.add(int(tok))
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    pids.discard(os.getpid())
+    return sorted(pids)
+
+
+def _port_owner_lines(port):
+    """端口被占用时，给出「谁占的 / 怎么停」的可操作提示。"""
+    pids = _pids_listening_on(port)
+    if not pids:
+        return ["       没能自动查出占用进程，可手动看："
+                "lsof -nP -iTCP:%d -sTCP:LISTEN" % port]
+    lines = []
+    for pid in pids:
+        lines.append("       占用进程  PID %-7d %s"
+                     % (pid, (_proc_cmdline(pid) or "(命令行未知)")[:100]))
+    lines.append("       停掉它    kill %s" % " ".join(str(p) for p in pids))
+    return lines
+
+
+def stop_instances(port=None):
+    """
+    停掉本工具的旧实例。只处理命令行里含 check.py 的进程，不会误杀别的服务。
+
+    port 给定时只停「占用该端口的那个」；不给则停掉所有本工具实例。
+    有了它，端口被占用时不必换端口：--stop 一下就干净了。
+    """
+    me = os.getpid()
+    candidates = _pids_listening_on(port) if port is not None else list(_iter_pids())
+
+    targets = []
+    unreadable = []                 # 能定位到进程，但读不到命令行
+    foreign = []                    # 读到了，但不是本工具
+    for pid in candidates:
+        if pid == me:
+            continue
+        cmd = _proc_cmdline(pid)
+        if not cmd:
+            unreadable.append(pid)
+            continue
+        if "check.py" not in cmd:
+            foreign.append((pid, cmd))
+            continue
+        targets.append((pid, cmd))  # 只动自己人
+
+    if not targets:
+        where = "端口 %d 上" % port if port is not None else "系统里"
+        print("[--stop] %s没有发现可停止的本工具实例。" % where)
+        for pid in unreadable:
+            print("  PID %-7d 读不到命令行（权限限制？），请自行确认后停止："
+                  "kill %d" % (pid, pid))
+        for pid, cmd in foreign:
+            print("  PID %-7d 是其它程序，未做任何处理：%s" % (pid, cmd[:80]))
+        return 0
+
+    print("[--stop] 正在停止 %d 个实例：" % len(targets))
+    for pid, cmd in targets:
+        print("  PID %-7d %s" % (pid, cmd[:100]))
+    for pid, _ in targets:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError as e:
+            print("  PID %d 发送停止信号失败：%s" % (pid, e))
+
+    for _ in range(50):                  # 最多等 5 秒
+        time.sleep(0.1)
+        if port is not None and is_port_free("0.0.0.0", port):
+            break
+        if all(not _pid_alive(p) for p, _ in targets):
+            break
+
+    stuck = (not is_port_free("0.0.0.0", port)) if port is not None \
+        else any(_pid_alive(p) for p, _ in targets)
+    if stuck:
+        print("[--stop] 有进程没有自行退出，可以强制结束：")
+        for pid, _ in targets:
+            print("  kill -9 %d" % pid)
+        return 1
+    print("[--stop] 已全部停止。")
+    return 0
+
+
 def serve(host, port):
     if not is_port_free(host, port):
         print("[错误] 端口 %d 已被占用。" % port, file=sys.stderr)
-        print("       可用 netstat -tlnp | grep %d 查看占用进程，" % port, file=sys.stderr)
-        print("       或用 --port 换一个端口。", file=sys.stderr)
+        for line in _port_owner_lines(port):
+            print(line, file=sys.stderr)
+        print("       停止本工具的旧实例：%s --stop --port %d"
+              % (os.path.basename(sys.argv[0] or "check.py"), port), file=sys.stderr)
+        print("       或换个端口启动：--port <其它端口>", file=sys.stderr)
+        print("       注：--stop 只停命令行里含 check.py 的本工具实例，不动别的服务。",
+              file=sys.stderr)
         return 1
 
+    _install_signal_handlers()
     httpd = ThreadingHTTPServer((host, port), Handler)
     httpd.daemon_threads = True
 
@@ -1950,9 +2102,11 @@ def main():
         description="OpenWrt / LuCI 批量弱口令审计（Linux 零依赖单文件版）")
     ap.add_argument("--host", default=os.environ.get("OPENWRT_CHECKER_HOST", DEFAULT_HOST),
                     help="监听地址，默认 0.0.0.0")
-    ap.add_argument("--port", type=int,
-                    default=int(os.environ.get("OPENWRT_CHECKER_PORT", DEFAULT_PORT)),
-                    help="监听端口，默认 5678")
+    ap.add_argument("--port", type=int, default=None,
+                    help="监听端口，默认 5678（也可用环境变量 OPENWRT_CHECKER_PORT 设置）")
+    ap.add_argument("--stop", action="store_true",
+                    help="停掉本工具的旧实例（端口被占用时用）；"
+                         "配合 --port 只停占用该端口的那个")
     ap.add_argument("--selftest", action="store_true",
                     help="运行本地自测（不需要路由器），验证不会误判")
     ap.add_argument("--version", action="version", version="%(prog)s " + VERSION)
@@ -1961,11 +2115,23 @@ def main():
     if args.selftest:
         return run_selftest()
 
+    if args.stop:
+        # 没显式给 --port 就停掉所有本工具实例
+        return stop_instances(port=args.port)
+
     if sys.version_info < (3, 6):
         print("[错误] 需要 Python 3.6 或更高版本，当前为 %s" % sys.version.split()[0],
               file=sys.stderr)
         return 1
-    return serve(args.host, args.port)
+    port = args.port
+    if port is None:
+        port = int(os.environ.get("OPENWRT_CHECKER_PORT", DEFAULT_PORT))
+
+    try:
+        return serve(args.host, port)
+    except KeyboardInterrupt:
+        print("\n已停止。", flush=True)
+        return 0
 
 
 if __name__ == "__main__":
